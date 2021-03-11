@@ -28,6 +28,7 @@ license {
         "libgav1/LICENSE",
     ],
 }
+
 bug_component_id = 324837
 
 fuzz_email_cc = ["jzern@google.com"]
