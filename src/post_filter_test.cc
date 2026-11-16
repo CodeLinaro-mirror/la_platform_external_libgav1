@@ -35,6 +35,7 @@
 #include "src/threading_strategy.h"
 #include "src/utils/array_2d.h"
 #include "src/utils/common.h"
+#include "src/utils/compiler_attributes.h"
 #include "src/utils/constants.h"
 #include "src/utils/types.h"
 #include "src/yuv_buffer.h"
@@ -1075,5 +1076,218 @@ INSTANTIATE_TEST_SUITE_P(PostFilterApplyCdefTestInstance,
                          PostFilterApplyCdefTest12bpp,
                          testing::ValuesIn(kTestParamApplyCdef));
 #endif  // LIBGAV1_MAX_BITDEPTH == 12
+
+namespace {
+
+ObuSequenceHeader DefaultDeblockSequenceHeader() {
+  ObuSequenceHeader sequence_header = {};
+  sequence_header.color_config.bitdepth = kBitdepth8;
+  sequence_header.color_config.is_monochrome = false;
+  sequence_header.color_config.subsampling_x = 1;
+  sequence_header.color_config.subsampling_y = 1;
+  return sequence_header;
+}
+
+ObuFrameHeader DefaultDeblockFrameHeader() {
+  ObuFrameHeader frame_header = {};
+  frame_header.width = 64;
+  frame_header.upscaled_width = 64;
+  frame_header.height = 64;
+  frame_header.rows4x4 = 16;
+  frame_header.columns4x4 = 16;
+  frame_header.tile_info.tile_count = 1;
+  return frame_header;
+}
+
+TEST(PostFilterDeblockLevelsTest, ZeroChromaFilterLevelWithoutRefModeDeltas) {
+  const ObuSequenceHeader sequence_header = DefaultDeblockSequenceHeader();
+  ObuFrameHeader frame_header = DefaultDeblockFrameHeader();
+  frame_header.delta_lf.present = true;
+  frame_header.delta_lf.multi = true;
+  // Y vertical > 0 enables deblocking; Y horizontal == 0 still participates in
+  // delta_lf, whereas U == 0 disables U-plane filtering (zero-initialized
+  // under LIBGAV1_MSAN).
+  frame_header.loop_filter.level = {12, 0, 0, 10};
+
+  YuvBuffer buffer;
+  ASSERT_TRUE(buffer.Realloc(
+      kBitdepth8, /*is_monochrome=*/false, frame_header.width,
+      frame_header.height, sequence_header.color_config.subsampling_x,
+      sequence_header.color_config.subsampling_y, kBorderPixels, kBorderPixels,
+      kBorderPixels, kBorderPixels, nullptr, nullptr, nullptr));
+  const dsp::Dsp* const dsp = dsp::GetDspTable(kBitdepth8);
+  ASSERT_NE(dsp, nullptr);
+  FrameScratchBuffer frame_scratch_buffer;
+
+  PostFilter post_filter(frame_header, sequence_header, &frame_scratch_buffer,
+                         &buffer, dsp, /*do_post_filter_mask=*/0x01);
+  ASSERT_TRUE(post_filter.DoDeblock());
+
+  const uint8_t expected_zero_delta[kFrameLfCount] = {12, 0, 0, 10};
+  for (int level_index = 0; level_index < kFrameLfCount; ++level_index) {
+#if !LIBGAV1_MSAN
+    if (level_index == 2) continue;
+#endif
+    for (int ref = kReferenceFrameIntra; ref < kNumReferenceFrameTypes; ++ref) {
+      const auto ref_type = static_cast<ReferenceFrameType>(ref);
+      const int max_mode_id = (ref_type == kReferenceFrameIntra) ? 1 : 2;
+      for (int mode_id = 0; mode_id < max_mode_id; ++mode_id) {
+        EXPECT_EQ(post_filter.GetZeroDeltaDeblockFilterLevel(
+                      /*segment_id=*/0, level_index, ref_type, mode_id),
+                  expected_zero_delta[level_index])
+            << "level_index=" << level_index << " ref=" << ref
+            << " mode_id=" << mode_id;
+      }
+    }
+  }
+
+  const int8_t delta_lf[kFrameLfCount] = {4, 6, 8, -3};
+  const uint8_t expected_with_delta[kFrameLfCount] = {16, 6, 0, 7};
+  uint8_t levels_uninit[kMaxSegments][kFrameLfCount][kNumReferenceFrameTypes]
+                       [2];
+  post_filter.ComputeDeblockFilterLevels(delta_lf, levels_uninit);
+
+  uint8_t levels_dirty[kMaxSegments][kFrameLfCount][kNumReferenceFrameTypes][2];
+  memset(levels_dirty, 0xff, sizeof(levels_dirty));
+  post_filter.ComputeDeblockFilterLevels(delta_lf, levels_dirty);
+
+  for (int level_index = 0; level_index < kFrameLfCount; ++level_index) {
+#if !LIBGAV1_MSAN
+    if (level_index == 2) continue;
+#endif
+    for (int ref = kReferenceFrameIntra; ref < kNumReferenceFrameTypes; ++ref) {
+      const int max_mode_id = (ref == kReferenceFrameIntra) ? 1 : 2;
+      for (int mode_id = 0; mode_id < max_mode_id; ++mode_id) {
+        EXPECT_EQ(levels_uninit[0][level_index][ref][mode_id],
+                  expected_with_delta[level_index])
+            << "level_index=" << level_index << " ref=" << ref
+            << " mode_id=" << mode_id;
+        EXPECT_EQ(levels_dirty[0][level_index][ref][mode_id],
+                  expected_with_delta[level_index])
+            << "level_index=" << level_index << " ref=" << ref
+            << " mode_id=" << mode_id;
+      }
+    }
+  }
+}
+
+TEST(PostFilterDeblockLevelsTest,
+     ZeroChromaFilterLevelsWithSegmentationAndRefModeDeltas) {
+  const ObuSequenceHeader sequence_header = DefaultDeblockSequenceHeader();
+  ObuFrameHeader frame_header = DefaultDeblockFrameHeader();
+  // Y horizontal > 0 enables deblocking while both chroma levels are 0.
+  frame_header.loop_filter.level = {0, 15, 0, 0};
+  frame_header.loop_filter.delta_enabled = true;
+  frame_header.loop_filter.ref_deltas = {1, 0, 0, 0, -1, 0, -1, -1};
+  frame_header.loop_filter.mode_deltas = {0, 2};
+  frame_header.segmentation.enabled = true;
+  frame_header.segmentation
+      .feature_enabled[3][kSegmentFeatureLoopFilterYVertical] = true;
+  frame_header.segmentation
+      .feature_data[3][kSegmentFeatureLoopFilterYVertical] = 5;
+  frame_header.segmentation
+      .feature_enabled[3][kSegmentFeatureLoopFilterYHorizontal] = true;
+  frame_header.segmentation
+      .feature_data[3][kSegmentFeatureLoopFilterYHorizontal] = 20;
+  frame_header.segmentation.feature_enabled[3][kSegmentFeatureLoopFilterU] =
+      true;
+  frame_header.segmentation.feature_data[3][kSegmentFeatureLoopFilterU] = 7;
+  frame_header.segmentation.feature_enabled[3][kSegmentFeatureLoopFilterV] =
+      true;
+  frame_header.segmentation.feature_data[3][kSegmentFeatureLoopFilterV] = 9;
+
+  YuvBuffer buffer;
+  ASSERT_TRUE(buffer.Realloc(
+      kBitdepth8, /*is_monochrome=*/false, frame_header.width,
+      frame_header.height, sequence_header.color_config.subsampling_x,
+      sequence_header.color_config.subsampling_y, kBorderPixels, kBorderPixels,
+      kBorderPixels, kBorderPixels, nullptr, nullptr, nullptr));
+  const dsp::Dsp* const dsp = dsp::GetDspTable(kBitdepth8);
+  ASSERT_NE(dsp, nullptr);
+  FrameScratchBuffer frame_scratch_buffer;
+
+  PostFilter post_filter(frame_header, sequence_header, &frame_scratch_buffer,
+                         &buffer, dsp, /*do_post_filter_mask=*/0x01);
+  ASSERT_TRUE(post_filter.DoDeblock());
+
+#if LIBGAV1_MSAN
+  const int8_t delta_lf[kFrameLfCount] = {2, 0, 0, 0};
+  uint8_t levels_uninit[kMaxSegments][kFrameLfCount][kNumReferenceFrameTypes]
+                       [2];
+  post_filter.ComputeDeblockFilterLevels(delta_lf, levels_uninit);
+
+  uint8_t levels_dirty[kMaxSegments][kFrameLfCount][kNumReferenceFrameTypes][2];
+  memset(levels_dirty, 0xff, sizeof(levels_dirty));
+  post_filter.ComputeDeblockFilterLevels(delta_lf, levels_dirty);
+
+  for (int segment_id = 0; segment_id < kMaxSegments; ++segment_id) {
+    for (int level_index = 2; level_index < kFrameLfCount; ++level_index) {
+      for (int ref = kReferenceFrameIntra; ref < kNumReferenceFrameTypes;
+           ++ref) {
+        const auto ref_type = static_cast<ReferenceFrameType>(ref);
+        const int max_mode_id = (ref_type == kReferenceFrameIntra) ? 1 : 2;
+        for (int mode_id = 0; mode_id < max_mode_id; ++mode_id) {
+          EXPECT_EQ(post_filter.GetZeroDeltaDeblockFilterLevel(
+                        segment_id, level_index, ref_type, mode_id),
+                    0)
+              << "segment_id=" << segment_id << " level_index=" << level_index
+              << " ref=" << ref << " mode_id=" << mode_id;
+          EXPECT_EQ(levels_uninit[segment_id][level_index][ref][mode_id], 0)
+              << "segment_id=" << segment_id << " level_index=" << level_index
+              << " ref=" << ref << " mode_id=" << mode_id;
+          EXPECT_EQ(levels_dirty[segment_id][level_index][ref][mode_id], 0)
+              << "segment_id=" << segment_id << " level_index=" << level_index
+              << " ref=" << ref << " mode_id=" << mode_id;
+        }
+      }
+    }
+  }
+#endif  // LIBGAV1_MSAN
+
+  // Segment 0: base levels are 0 (shift 0) and 15 (shift 0).
+  EXPECT_EQ(
+      post_filter.GetZeroDeltaDeblockFilterLevel(0, 0, kReferenceFrameIntra, 0),
+      1);
+  EXPECT_EQ(
+      post_filter.GetZeroDeltaDeblockFilterLevel(0, 0, kReferenceFrameLast, 0),
+      0);
+  EXPECT_EQ(
+      post_filter.GetZeroDeltaDeblockFilterLevel(0, 0, kReferenceFrameLast, 1),
+      2);
+  EXPECT_EQ(post_filter.GetZeroDeltaDeblockFilterLevel(
+                0, 0, kReferenceFrameGolden, 0),
+            0);
+  EXPECT_EQ(
+      post_filter.GetZeroDeltaDeblockFilterLevel(0, 1, kReferenceFrameIntra, 0),
+      16);
+  EXPECT_EQ(
+      post_filter.GetZeroDeltaDeblockFilterLevel(0, 1, kReferenceFrameLast, 1),
+      17);
+  EXPECT_EQ(post_filter.GetZeroDeltaDeblockFilterLevel(
+                0, 1, kReferenceFrameGolden, 0),
+            14);
+
+  // Segment 3: base levels are 5 (shift 0) and 35 (shift 1).
+  EXPECT_EQ(
+      post_filter.GetZeroDeltaDeblockFilterLevel(3, 0, kReferenceFrameIntra, 0),
+      6);
+  EXPECT_EQ(
+      post_filter.GetZeroDeltaDeblockFilterLevel(3, 0, kReferenceFrameLast, 1),
+      7);
+  EXPECT_EQ(
+      post_filter.GetZeroDeltaDeblockFilterLevel(3, 1, kReferenceFrameIntra, 0),
+      37);
+  EXPECT_EQ(
+      post_filter.GetZeroDeltaDeblockFilterLevel(3, 1, kReferenceFrameLast, 0),
+      35);
+  EXPECT_EQ(
+      post_filter.GetZeroDeltaDeblockFilterLevel(3, 1, kReferenceFrameLast, 1),
+      39);
+  EXPECT_EQ(post_filter.GetZeroDeltaDeblockFilterLevel(
+                3, 1, kReferenceFrameGolden, 0),
+            33);
+}
+
+}  // namespace
 
 }  // namespace libgav1

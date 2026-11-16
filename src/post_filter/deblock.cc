@@ -22,6 +22,7 @@
 #include "src/dsp/dsp.h"
 #include "src/post_filter.h"
 #include "src/utils/common.h"
+#include "src/utils/compiler_attributes.h"
 #include "src/utils/constants.h"
 #include "src/utils/types.h"
 
@@ -125,6 +126,16 @@ void PostFilter::ComputeDeblockFilterLevels(
         ComputeDeblockFilterLevelsHelper(
             frame_header_, segment_id, level_index, delta_lf,
             deblock_filter_levels[segment_id][level_index]);
+#if LIBGAV1_MSAN
+      } else {
+        // Tile::PopulateDeblockFilterLevel() copies all kFrameLfCount entries,
+        // triggering MSan's -fsanitize-memory-param-retval check when
+        // GetZeroDeltaDeblockFilterLevel() is not inlined (e.g., at -O1).
+        // Disabled chroma entries are otherwise unused as UV deblocking checks
+        // loop_filter.level[2..3] != 0 before reading them.
+        memset(deblock_filter_levels[segment_id][level_index], 0,
+               sizeof(deblock_filter_levels[segment_id][level_index]));
+#endif
       }
     }
   }
