@@ -85,8 +85,6 @@ class DistanceWeightedBlendTest : public testing::TestWithParam<BlockSize>,
   alignas(kMaxAlignment) PredType
       source2_[kMaxSuperBlockSizeInPixels * kMaxSuperBlockSizeInPixels];
   Pixel dest_[kMaxSuperBlockSizeInPixels * kMaxSuperBlockSizeInPixels] = {};
-  Pixel reference_[kMaxSuperBlockSizeInPixels * kMaxSuperBlockSizeInPixels] =
-      {};
   dsp::DistanceWeightedBlendFunc base_func_;
   dsp::DistanceWeightedBlendFunc func_;
 };

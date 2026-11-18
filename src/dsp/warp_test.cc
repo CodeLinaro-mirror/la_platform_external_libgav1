@@ -295,7 +295,6 @@ class WarpTest : public testing::TestWithParam<WarpTestParam> {
   const WarpTestParam param_ = GetParam();
 
  private:
-  int warp_params_[8];
   dsp::WarpFunc func_;
   // Warp filters are 7-tap, which needs 3 pixels (kConvolveBorderLeftTop)
   // padding. Destination buffer indices are based on subsampling values (x+y):
